@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS pending_state (
     breakdown_json TEXT,
     awaiting_field TEXT,
     awaiting_kind TEXT,
+    clarify_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 
@@ -64,6 +65,13 @@ def connect() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Additive migration for databases created before clarify_count.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(pending_state)")}
+        if "clarify_count" not in cols:
+            conn.execute(
+                "ALTER TABLE pending_state "
+                "ADD COLUMN clarify_count INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 # --- transcripts_log -------------------------------------------------------
@@ -98,22 +106,26 @@ def save_pending(
     breakdown: dict[str, Any] | None = None,
     awaiting_field: str | None = None,
     awaiting_kind: str | None = None,
+    clarify_count: int = 0,
 ) -> None:
     with connect() as conn:
         conn.execute(
             "INSERT INTO pending_state "
-            "(chat_id, spec_json, breakdown_json, awaiting_field, awaiting_kind, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "(chat_id, spec_json, breakdown_json, awaiting_field, awaiting_kind, "
+            "clarify_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "spec_json=excluded.spec_json, breakdown_json=excluded.breakdown_json, "
             "awaiting_field=excluded.awaiting_field, "
-            "awaiting_kind=excluded.awaiting_kind, updated_at=excluded.updated_at",
+            "awaiting_kind=excluded.awaiting_kind, "
+            "clarify_count=excluded.clarify_count, updated_at=excluded.updated_at",
             (
                 chat_id,
                 json.dumps(spec, ensure_ascii=False),
                 json.dumps(breakdown, ensure_ascii=False) if breakdown else None,
                 awaiting_field,
                 awaiting_kind,
+                clarify_count,
                 _now(),
             ),
         )
@@ -132,6 +144,7 @@ def get_pending(chat_id: int) -> dict[str, Any] | None:
         "breakdown": json.loads(row["breakdown_json"]) if row["breakdown_json"] else None,
         "awaiting_field": row["awaiting_field"],
         "awaiting_kind": row["awaiting_kind"],
+        "clarify_count": row["clarify_count"],
     }
 
 

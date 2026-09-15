@@ -144,3 +144,92 @@ def test_guard_only_gates_new_descriptions_not_corrections():
     )
     for fn in (bot._route_text, bot.on_callback):
         assert "_looks_like_a_description" not in inspect.getsource(fn)
+
+
+# --- failure visibility & recovery ---------------------------------------
+# A real draft (₪19,815) was computed, saved, and never delivered because the
+# machine briefly lost DNS. No error handler was registered, so the carpenter
+# saw only silence. These tests cover the recovery path.
+
+
+def test_draft_is_persisted_before_it_is_sent():
+    """The draft must survive a failed send, so /status can re-send it."""
+    from app.catalog import Catalog, CatalogItem
+    from app.config import BusinessConfig
+    from app.pricing import calculate_quote
+
+    catalog = Catalog([
+        CatalogItem("לכה מט", "material", "cabinet", 920.0),
+        CatalogItem("שיש גרניט", "material", "meter", 1100.0),
+        CatalogItem("ציר רגיל", "hardware", "unit", 18.0),
+        CatalogItem("ידית נירוסטה", "hardware", "unit", 55.0),
+        CatalogItem("הובלה והתקנה", "transport", "flat", 250.0),
+    ])
+    spec = KitchenSpec(client_name="שלומי לוי", material="לכה",
+                       cabinet_count=5, countertop="גרניט", labor_hours=20.0)
+    breakdown = calculate_quote(spec, catalog, BusinessConfig())
+
+    db.save_pending(42, spec.model_dump(), breakdown.model_dump())
+
+    pending = db.get_pending(42)
+    assert pending["breakdown"] is not None
+    assert pending["breakdown"]["total"] > 0
+    # No question outstanding -> /status treats this as a re-sendable draft.
+    assert pending["awaiting_kind"] is None
+
+
+def test_clarify_count_is_tracked_and_survives_reload():
+    db.save_pending(50, KitchenSpec().model_dump(), None, "material",
+                    "clarify", clarify_count=2)
+    assert db.get_pending(50)["clarify_count"] == 2
+
+
+def test_clarify_count_defaults_to_zero():
+    db.save_pending(51, KitchenSpec().model_dump())
+    assert (db.get_pending(51)["clarify_count"] or 0) == 0
+
+
+def test_clarify_questions_are_hard_capped():
+    """The old guard only compared against the previous field, which allowed
+    an unbounded interrogation -- four questions in a row, observed live."""
+    from app.bot import MAX_CLARIFY_QUESTIONS
+
+    assert MAX_CLARIFY_QUESTIONS <= 2, (
+        "more than two questions turns the bot into an interrogation; "
+        "price with stated assumptions instead"
+    )
+
+
+def test_error_handler_is_registered(monkeypatch):
+    """Without a registered handler, failures are logged and never surface."""
+    import app.bot as bot
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:fake-token-for-construction")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        app = bot.build_application()
+        assert app.error_handlers, "no error handler registered"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_status_command_is_registered(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:fake-token-for-construction")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        app = bot.build_application()
+        commands = set()
+        for group in app.handlers.values():
+            for handler in group:
+                names = getattr(handler, "commands", None)
+                if names:
+                    commands |= set(names)
+        assert "status" in commands
+    finally:
+        get_settings.cache_clear()

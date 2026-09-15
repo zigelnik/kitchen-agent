@@ -8,10 +8,12 @@ not lose an in-progress quote.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -52,7 +54,10 @@ WELCOME = (
     "ואני אכין הצעת מחיר.\n\n"
     "לדוגמה: \"מטבח בצורת L ללקוח דני, 12 ארונות פורניר אלון, "
     "6 מגירות בלום, שיש אבן קיסר 4 מטר, ידיות שחורות\"\n\n"
-    "פקודות: /new להתחלה מחדש, /last להצעה האחרונה"
+    "פקודות:\n"
+    "/status — מה מצב העבודה הנוכחית\n"
+    "/new — להתחיל מחדש\n"
+    "/last — ההצעה האחרונה"
 )
 
 
@@ -130,6 +135,65 @@ def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
     return "\n".join(lines)
 
 
+SEND_RETRIES = 4
+SEND_BACKOFF_BASE = 1.5
+
+
+async def _send_with_retry(coro_factory, what: str):
+    """Retry a Telegram send through transient network loss.
+
+    A real draft was computed and then lost because the machine briefly failed
+    DNS resolution: the quote existed in the database but never reached the
+    carpenter, and with no error handler registered he saw only silence.
+    Retrying costs nothing and covers the common case of a few seconds offline.
+    """
+    delay = SEND_BACKOFF_BASE
+    for attempt in range(1, SEND_RETRIES + 1):
+        try:
+            return await coro_factory()
+        except (NetworkError, TimedOut) as exc:
+            if attempt == SEND_RETRIES:
+                log.error("%s failed after %d attempts: %s", what, attempt, exc)
+                raise
+            log.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                what, attempt, SEND_RETRIES, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global handler so a failure always reaches the carpenter.
+
+    Without this, python-telegram-bot logs "No error handlers are registered"
+    and the user is left staring at a chat that never answers.
+    """
+    log.exception("handler error", exc_info=context.error)
+
+    chat_id = None
+    if isinstance(update, Update) and update.effective_chat is not None:
+        chat_id = update.effective_chat.id
+    if chat_id is None:
+        return
+
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        text = (
+            "📡 נפלה התקשורת מול טלגרם באמצע הפעולה.\n"
+            "הנתונים נשמרו — שלח /status לראות מה מצב הטיוטה."
+        )
+    else:
+        text = (
+            "⚠️ משהו נכשל בעיבוד הבקשה.\n"
+            "שלח /status לראות מה מצב הטיוטה, או /new להתחיל מחדש."
+        )
+    try:
+        await context.bot.send_message(chat_id, text)
+    except Exception:
+        # The network is the thing that is broken; nothing more to do.
+        log.error("could not deliver the error notice to %s", chat_id)
+
+
 def _draft_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ אישור", callback_data=CB_APPROVE),
@@ -145,15 +209,27 @@ async def _price_and_show_draft(
 ) -> None:
     """Price the spec, persist it, and show the draft with action buttons."""
     breakdown = calculate_quote(spec, load_catalog(), get_settings().business)
+    # Persist BEFORE sending, so a send that fails leaves a recoverable draft
+    # rather than losing the work entirely.
     db.save_pending(chat_id, spec.model_dump(), breakdown.model_dump())
 
     target = update.effective_message
-    await target.reply_text(
-        _format_draft(spec, breakdown),
-        parse_mode="Markdown",
-        reply_markup=_draft_keyboard(),
+    await _send_with_retry(
+        lambda: target.reply_text(
+            _format_draft(spec, breakdown),
+            parse_mode="Markdown",
+            reply_markup=_draft_keyboard(),
+        ),
+        "draft send",
     )
 
+
+# Hard cap on clarifying questions. The previous guard only checked that the
+# next question differed from the last, which let the bot interrogate the
+# carpenter field by field (observed: four questions in a row). Better to
+# price with stated assumptions -- every one is shown in the draft -- than to
+# keep asking.
+MAX_CLARIFY_QUESTIONS = 2
 
 MIN_DESCRIPTION_CHARS = 12
 MIN_DESCRIPTION_WORDS = 3
@@ -196,10 +272,12 @@ async def _handle_new_description(
 
     try:
         spec = parse_transcript(text)
-    except Exception:
+    except Exception as exc:
         log.exception("parse failed")
         await update.effective_message.reply_text(
-            "לא הצלחתי לנתח את התיאור. אפשר לנסות שוב בבקשה?"
+            "❌ לא הצלחתי לנתח את התיאור.\n"
+            f"סיבה: {type(exc).__name__}\n"
+            "אפשר לנסות שוב, או /new להתחיל מחדש."
         )
         return
 
@@ -210,9 +288,12 @@ async def _handle_new_description(
         field, text_q = question
         db.save_pending(
             chat_id, spec.model_dump(), None, awaiting_field=field,
-            awaiting_kind=AWAIT_CLARIFY,
+            awaiting_kind=AWAIT_CLARIFY, clarify_count=1,
         )
-        await update.effective_message.reply_text(f"❓ {text_q}")
+        await _send_with_retry(
+            lambda: update.effective_message.reply_text(f"❓ {text_q}"),
+            "clarifying question",
+        )
         return
 
     await _price_and_show_draft(update, chat_id, spec)
@@ -251,6 +332,86 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _edit_or_send(status_msg, fallback_msg, text: str) -> None:
+    """Update the progress message in place, falling back to a new message.
+
+    Editing keeps the chat tidy: one status line that advances through the
+    stages rather than a stack of transient notices.
+    """
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        try:
+            await fallback_msg.reply_text(text)
+        except Exception:
+            log.exception("could not report progress")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report where the current job stands, and re-send a lost draft.
+
+    This exists because a computed draft can be stranded in the database by a
+    network blip. /status both explains the state and recovers from it.
+    """
+    if not _is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    pending = db.get_pending(chat_id)
+
+    if pending is None:
+        row = db.latest_quote(chat_id)
+        if row is None:
+            await update.effective_message.reply_text(
+                "אין עבודה פעילה. שלח הקלטה או תיאור מטבח כדי להתחיל."
+            )
+            return
+        sym = get_settings().business.currency_symbol
+        await update.effective_message.reply_text(
+            f"אין טיוטה פעילה.\n"
+            f"ההצעה האחרונה: #{row['id']} · {row['status']} · "
+            f"{sym}{row['total_ils']:,.0f}"
+        )
+        return
+
+    spec = KitchenSpec(**pending["spec"])
+    kind = pending["awaiting_kind"]
+
+    if kind == AWAIT_CLARIFY and pending["awaiting_field"]:
+        field = pending["awaiting_field"]
+        question = FIELD_QUESTIONS_HE.get(field, field)
+        await update.effective_message.reply_text(
+            f"⏳ אני ממתין לתשובה על: {question}"
+        )
+        return
+
+    if kind == AWAIT_CORRECTION:
+        await update.effective_message.reply_text(
+            "⏳ אני ממתין לתיקון. כתוב או הקלט מה לשנות."
+        )
+        return
+
+    # A breakdown exists but no question is pending: the draft was computed.
+    # If it never arrived (a send that failed), re-send it now.
+    if pending["breakdown"]:
+        breakdown = QuoteBreakdown(**pending["breakdown"])
+        await update.effective_message.reply_text(
+            "יש טיוטה מחושבת. שולח אותה שוב:"
+        )
+        await _send_with_retry(
+            lambda: update.effective_message.reply_text(
+                _format_draft(spec, breakdown),
+                parse_mode="Markdown",
+                reply_markup=_draft_keyboard(),
+            ),
+            "status draft re-send",
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "יש מפרט חלקי אבל בלי חישוב. שלח /new כדי להתחיל מחדש."
+    )
+
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
@@ -270,19 +431,32 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("לא הצלחתי להוריד את ההקלטה.")
         return
 
-    await message.reply_text("🎧 מתמלל...")
+    status = await message.reply_text("🎧 מתמלל... (עד חצי דקה)")
+
+    # Transcription is CPU-bound and takes 10-30s; run it off the event loop
+    # so the bot keeps answering and the typing indicator stays alive.
     try:
-        text = transcribe(audio_path)
+        text = await asyncio.to_thread(transcribe, audio_path)
     except Exception:
         log.exception("transcription failed")
-        await message.reply_text("התמלול נכשל. אפשר לשלוח את התיאור כטקסט?")
+        await _edit_or_send(
+            status, message,
+            "❌ התמלול נכשל. אפשר לשלוח את התיאור כטקסט?",
+        )
         return
 
     if not text:
-        await message.reply_text("לא זיהיתי דיבור בהקלטה.")
+        await _edit_or_send(
+            status, message,
+            "🔇 לא זיהיתי דיבור בהקלטה. אפשר לנסות שוב?",
+        )
         return
 
-    await message.reply_text(f"📝 _{text}_", parse_mode="Markdown")
+    await _edit_or_send(status, message, f"📝 {text}")
+    await _send_with_retry(
+        lambda: context.bot.send_chat_action(chat_id, ChatAction.TYPING),
+        "typing action",
+    )
     await _route_text(update, context, chat_id, text, was_voice=True)
 
 
@@ -323,14 +497,24 @@ async def _route_text(
             return
         db.log_interaction(chat_id, transcript=text, parsed=spec.model_dump())
 
-        # Ask at most one more question, then price regardless so the
-        # carpenter is never stuck in an interrogation loop.
+        # Hard-capped: past MAX_CLARIFY_QUESTIONS we price with assumptions
+        # rather than keep interrogating. The assumptions are all listed in
+        # the draft, and the carpenter can still correct any of them.
+        asked = pending.get("clarify_count") or 0
         question = next_clarifying_question(spec)
-        if question is not None and question[0] != field:
+        if (
+            question is not None
+            and question[0] != field
+            and asked < MAX_CLARIFY_QUESTIONS
+        ):
             nxt_field, nxt_text = question
             db.save_pending(chat_id, spec.model_dump(), None,
-                            awaiting_field=nxt_field, awaiting_kind=AWAIT_CLARIFY)
-            await update.effective_message.reply_text(f"❓ {nxt_text}")
+                            awaiting_field=nxt_field, awaiting_kind=AWAIT_CLARIFY,
+                            clarify_count=asked + 1)
+            await _send_with_retry(
+                lambda: update.effective_message.reply_text(f"❓ {nxt_text}"),
+                "clarifying question",
+            )
             return
 
         await _price_and_show_draft(update, chat_id, spec)
@@ -461,7 +645,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # Must be registered, or a failure is only logged and the carpenter sees
+    # nothing at all.
+    app.add_error_handler(on_error)
     return app
