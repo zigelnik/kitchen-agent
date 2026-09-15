@@ -1,0 +1,23 @@
+# Carpenter-editable business rates. Edit numbers here, not in Python.
+business:
+  business_name: "Mishel Boutique Kitchens"
+  currency: "ILS"
+  currency_symbol: "₪"
+
+  # What an hour of work costs the workshop.
+  labor_cost_per_hour: 50
+  # What an hour is billed to the client.
+  labor_bill_per_hour: 100
+
+  # Applied to materials + hardware. Labor is already marked up via the
+  # cost/bill spread above, so margin is NOT applied to labor twice.
+  margin_pct: 50
+
+  transport_flat: 250
+
+  # Israeli VAT is 18% as of 2025. Left at 0 until confirmed whether quotes
+  # should be shown inclusive or exclusive of VAT.
+  vat_pct: 0
+
+  payment_terms: "50% מקדמה בהזמנה, 50% בסיום ההתקנה"
+  quote_valid_days: 14

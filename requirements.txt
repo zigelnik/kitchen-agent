@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+python-telegram-bot>=22
+httpx
+pyyaml
+
+# LLM parsing (app runtime, not the build).
+anthropic
+
+# Local Hebrew speech-to-text; no API key, no second vendor.
+faster-whisper
+
+# PDF. ReportLab rather than WeasyPrint: WeasyPrint needs native GTK/Pango
+# libraries that are absent on stock Windows and cannot even import there.
+# ReportLab has no bidi support, hence python-bidi -- see app/pdf.py.
+reportlab
+python-bidi
+
+pytest
+# Used by tests to rasterize and read back rendered PDFs.
+pymupdf
