@@ -207,10 +207,12 @@ def test_watermark_background_is_normalized_to_white(tmp_path, monkeypatch):
 
     import app.pdf as pdf_mod
 
-    # A cream field with a dark mark, matching the real logo's structure.
+    # A cream field with TWO dark marks separated by background, matching the
+    # real logo's structure -- letters with gaps, not one solid block. A solid
+    # block would leave no background pixels after cropping.
     logo = tmp_path / "logo.png"
     img = Image.new("RGB", (200, 100), (249, 245, 242))
-    for x in range(80, 120):
+    for x in list(range(60, 80)) + list(range(120, 140)):
         for y in range(40, 60):
             img.putpixel((x, y), (120, 90, 10))
     img.save(logo)
@@ -225,11 +227,22 @@ def test_watermark_background_is_normalized_to_white(tmp_path, monkeypatch):
     faded = reader._image if hasattr(reader, "_image") else None
     if faded is None:
         pytest.skip("ImageReader did not expose the PIL image")
-    # The corner must be pure white, or it shows as a rectangle on the page.
-    assert faded.convert("RGB").getpixel((2, 2)) == (255, 255, 255)
-    # The mark itself must still be lighter than the original but present.
-    mark = faded.convert("RGB").getpixel((100, 50))
-    assert mark != (255, 255, 255), "the wordmark was faded away entirely"
+    rgb = faded.convert("RGB")
+
+    # The image is cropped to the wordmark, so sample the lightest pixel
+    # rather than a corner: whatever background remains between the letters
+    # must reach pure white, or it shows as a rectangle on the page.
+    # getdata() is deprecated in Pillow 14; extrema gives the per-channel
+    # min/max directly, which is all this assertion needs.
+    extrema = rgb.getextrema()
+    lightest = tuple(hi for _lo, hi in extrema)
+    darkest = tuple(lo for lo, _hi in extrema)
+    assert lightest == (255, 255, 255), (
+        f"background only reached {lightest}; a tinted block will show"
+    )
+    # The mark itself must survive the fade.
+    assert darkest != (255, 255, 255), "the wordmark was faded away entirely"
+    assert sum(darkest) < 3 * 250, "the wordmark is too faint to read"
 
 
 def test_watermark_is_cached_between_pages(tmp_path, monkeypatch):
@@ -258,3 +271,57 @@ def test_real_project_logo_produces_a_watermark():
     pdf_mod._watermark_cache = None
     pdf_mod._watermark_key = None
     assert pdf_mod._prepare_watermark() is not None
+
+
+def test_watermark_is_cropped_to_the_wordmark(tmp_path, monkeypatch):
+    """The supplied logo is a square with ~78% empty margin. Placing the whole
+    square as a footer mark would strand the letters inside a dead box."""
+    from PIL import Image
+
+    import app.pdf as pdf_mod
+
+    logo = tmp_path / "logo.png"
+    img = Image.new("RGB", (400, 400), (249, 245, 242))
+    # A wide mark occupying a thin horizontal band, like the real logo.
+    for x in range(50, 350):
+        for y in range(180, 220):
+            img.putpixel((x, y), (120, 90, 10))
+    img.save(logo)
+
+    monkeypatch.setattr(pdf_mod, "LOGO_PATH", logo)
+    monkeypatch.setattr(pdf_mod, "_watermark_cache", None)
+    monkeypatch.setattr(pdf_mod, "_watermark_key", None)
+
+    reader = pdf_mod._prepare_watermark()
+    w, h = reader.getSize()
+    # Cropped to the band, so it is much wider than tall -- not 400x400.
+    assert h < 400, "the empty margin was not cropped away"
+    assert w / h > 3, f"expected a wide wordmark, got {w}x{h}"
+
+
+def test_watermark_sits_in_the_bottom_third():
+    """Requested placement: a footer mark, not a centred background."""
+    from reportlab.lib.pagesizes import A4
+
+    import app.pdf as pdf_mod
+    from app.config import LOGO_PATH as real_logo
+
+    if not real_logo.exists():
+        pytest.skip("assets/logo.png not present")
+
+    pdf_mod._watermark_cache = None
+    pdf_mod._watermark_key = None
+    image = pdf_mod._prepare_watermark()
+    assert image is not None
+
+    iw, ih = image.getSize()
+    page_w, page_h = A4
+    target_w = page_w * pdf_mod.WATERMARK_WIDTH_FRAC
+    target_h = target_w * (ih / iw)
+    y = page_h * pdf_mod.WATERMARK_CENTER_Y_FRAC - target_h / 2
+    y = max(0.0, min(y, page_h / 3.0 - target_h))
+
+    assert y >= 0, "watermark runs off the bottom of the page"
+    assert y + target_h <= page_h / 3.0 + 1, (
+        "watermark escapes the bottom third of the page"
+    )

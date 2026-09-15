@@ -115,6 +115,15 @@ def quote_filename(
 WATERMARK_STRENGTH = 0.13
 WATERMARK_WIDTH_FRAC = 0.80
 
+# The watermark sits as a footer mark in the bottom third of the page. Its
+# centre is placed this far up from the page bottom, as a fraction of page
+# height -- i.e. the middle of the lower third.
+WATERMARK_CENTER_Y_FRAC = 0.17
+
+# Pixels differing from the sampled background by more than this count as
+# content when cropping away the logo's empty margin.
+_CONTENT_THRESHOLD = 12
+
 _watermark_cache: ImageReader | None = None
 _watermark_key: tuple[str, float, int] | None = None
 
@@ -144,12 +153,25 @@ def _prepare_watermark() -> ImageReader | None:
         with Image.open(LOGO_PATH) as src:
             logo = src.convert("RGB")
 
+        # Crop away the logo's empty margin. The supplied file is a 1600x1600
+        # square whose wordmark covers only ~70% x 22% of it; placing the
+        # whole square as a footer mark would put the visible letters in the
+        # middle of a large dead box instead of where they were aimed.
+        margin_bg = logo.getpixel((2, 2))
+        mask = ImageChops.difference(
+            logo, Image.new("RGB", logo.size, margin_bg)
+        ).convert("L").point(lambda v: 255 if v > _CONTENT_THRESHOLD else 0)
+        content = mask.getbbox()
+        if content is not None:
+            logo = logo.crop(content)
+
         # The logo sits on a cream field, not white. Blending straight to
         # white keeps that field as a visible tinted rectangle on the page,
-        # so first normalize the lightest pixels up to pure white: sample the
-        # corner for the background colour and scale each channel so it maps
-        # to 255. The dark wordmark is far from that value and survives.
-        bg = logo.getpixel((2, 2))
+        # so normalize the background up to pure white by scaling each channel
+        # so it maps to 255. The dark wordmark is far from that value and
+        # survives. Note the background colour is sampled BEFORE the crop --
+        # after cropping, the corner pixel may be part of a letter.
+        bg = margin_bg
         scales = [255.0 / max(c, 1) for c in bg]
         normalized = Image.merge("RGB", [
             # round(), not int(): truncation leaves the background a channel
@@ -177,7 +199,7 @@ def _prepare_watermark() -> ImageReader | None:
 
 
 def _draw_watermark(canvas, doc) -> None:
-    """Paint the logo as an enlarged, faint background on every page.
+    """Paint the faded logo as a footer mark in the bottom third of the page.
 
     Drawn on the canvas rather than added to the story so it sits behind the
     content and repeats per page without affecting layout.
@@ -191,12 +213,21 @@ def _draw_watermark(canvas, doc) -> None:
     target_w = page_w * WATERMARK_WIDTH_FRAC
     target_h = target_w * (ih / iw)
 
+    x = (page_w - target_w) / 2
+    # Centre it in the lower third, then clamp so a tall logo can neither run
+    # off the bottom edge nor climb out of the bottom third of the page.
+    y = page_h * WATERMARK_CENTER_Y_FRAC - target_h / 2
+    y = max(0.0, min(y, page_h / 3.0 - target_h))
+    if y < 0.0:
+        # Taller than the band: sit it on the bottom margin instead.
+        y = 0.0
+
     canvas.saveState()
     try:
         canvas.drawImage(
             image,
-            (page_w - target_w) / 2,
-            (page_h - target_h) / 2,
+            x,
+            y,
             width=target_w,
             height=target_h,
             preserveAspectRatio=True,
