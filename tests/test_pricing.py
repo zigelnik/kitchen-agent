@@ -213,14 +213,17 @@ def test_implausible_dimensions_produce_a_warning(real_catalog, business):
                        countertop="אבן קיסר", countertop_length_m=40.0,
                        labor_hours=25.0)
     q = calculate_quote(spec, real_catalog, business)
-    assert any("חריג" in w for w in q.warnings)
+    # Sanity alerts are separate from warnings: they block one-tap approval.
+    assert q.needs_confirmation
+    assert any("חריג" in a for a in q.sanity_alerts)
 
 
-def test_implausible_cabinet_count_warns(real_catalog, business):
+def test_implausible_cabinet_count_blocks_approval(real_catalog, business):
     spec = KitchenSpec(material="פורניר אלון", cabinet_count=200,
                        drawer_count=0, labor_hours=10.0)
     q = calculate_quote(spec, real_catalog, business)
-    assert any("חריג" in w for w in q.warnings)
+    assert q.needs_confirmation
+    assert any("חריג" in a for a in q.sanity_alerts)
 
 
 def test_plausible_values_produce_no_sanity_warnings(real_catalog, business):
@@ -229,4 +232,5 @@ def test_plausible_values_produce_no_sanity_warnings(real_catalog, business):
                        countertop="אבן קיסר", countertop_length_m=4.0,
                        labor_hours=25.0)
     q = calculate_quote(spec, real_catalog, business)
-    assert not [w for w in q.warnings if "חריג" in w]
+    assert not q.needs_confirmation
+    assert q.sanity_alerts == []

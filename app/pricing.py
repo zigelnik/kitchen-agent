@@ -53,6 +53,9 @@ def calculate_quote(
     spec: KitchenSpec, catalog: Catalog, business: BusinessConfig
 ) -> QuoteBreakdown:
     warnings: list[str] = []
+    # Implausible values go here, not in `warnings`: they block one-tap
+    # approval so a bad dimension cannot reach a client's PDF unchallenged.
+    sanity_alerts: list[str] = []
     lines: list[LineItem] = []
 
     # --- quantities ---
@@ -62,22 +65,18 @@ def calculate_quote(
         warnings.append(f"מספר ארונות לא צוין — הונח {cabinets}")
 
     if cabinets > MAX_PLAUSIBLE_CABINETS:
-        warnings.append(
-            f"⚠️ {cabinets} ארונות — מספר חריג, כדאי לוודא לפני שליחה"
-        )
+        sanity_alerts.append(f"{cabinets} ארונות — מספר חריג")
 
     drawers = spec.drawer_count if spec.drawer_count is not None else 0
     if spec.drawer_count is None:
         warnings.append("מספר מגירות לא צוין — הונח 0")
 
     if spec.countertop_length_m and spec.countertop_length_m > MAX_PLAUSIBLE_COUNTERTOP_M:
-        warnings.append(
-            f"⚠️ אורך משטח {spec.countertop_length_m} מ' — חריג, כדאי לוודא"
+        sanity_alerts.append(
+            f"אורך משטח {spec.countertop_length_m} מ' — חריג"
         )
     if spec.labor_hours and spec.labor_hours > MAX_PLAUSIBLE_LABOR_HOURS:
-        warnings.append(
-            f"⚠️ {spec.labor_hours} שעות עבודה — חריג, כדאי לוודא"
-        )
+        sanity_alerts.append(f"{spec.labor_hours} שעות עבודה — חריג")
 
     # --- carcass material, priced per cabinet ---
     mat = catalog.find(spec.material, category="material", kind="carcass")
@@ -201,4 +200,5 @@ def calculate_quote(
         total=total,
         currency_symbol=business.currency_symbol,
         warnings=warnings,
+        sanity_alerts=sanity_alerts,
     )

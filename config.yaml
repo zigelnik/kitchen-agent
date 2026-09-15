@@ -15,9 +15,9 @@ business:
 
   transport_flat: 250
 
-  # Israeli VAT is 18% as of 2025. Left at 0 until confirmed whether quotes
-  # should be shown inclusive or exclusive of VAT.
-  vat_pct: 0
+  # Israeli VAT. The PDF shows the subtotal, the VAT line, and the
+  # VAT-inclusive total, so both figures are visible to the client.
+  vat_pct: 18
 
   payment_terms: "50% מקדמה בהזמנה, 50% בסיום ההתקנה"
   quote_valid_days: 14

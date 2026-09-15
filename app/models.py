@@ -68,3 +68,12 @@ class QuoteBreakdown(BaseModel):
     total: float = 0.0
     currency_symbol: str = "₪"
     warnings: list[str] = Field(default_factory=list)
+
+    # Values outside plausible bounds (a 40m countertop, 200 cabinets). Kept
+    # separate from `warnings` because these block one-tap approval: a wrong
+    # dimension reaching a client's PDF is worse than an extra confirmation.
+    sanity_alerts: list[str] = Field(default_factory=list)
+
+    @property
+    def needs_confirmation(self) -> bool:
+        return bool(self.sanity_alerts)

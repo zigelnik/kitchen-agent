@@ -18,6 +18,8 @@ AUDIO_DIR = DATA_DIR / "audio"
 QUOTES_DIR = DATA_DIR / "quotes"
 DB_PATH = DATA_DIR / "kitchen.db"
 CATALOG_PATH = DATA_DIR / "catalog.csv"
+ASSETS_DIR = ROOT / "assets"
+LOGO_PATH = ASSETS_DIR / "logo.png"
 CONFIG_PATH = ROOT / "config.yaml"
 
 
@@ -98,5 +100,5 @@ def get_settings() -> Settings:
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, AUDIO_DIR, QUOTES_DIR):
+    for d in (DATA_DIR, AUDIO_DIR, QUOTES_DIR, ASSETS_DIR):
         d.mkdir(parents=True, exist_ok=True)

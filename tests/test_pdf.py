@@ -99,3 +99,99 @@ def test_vat_rows_appear_only_when_vat_configured(catalog, business, tmp_path,
 
     assert "18" in t2
     assert len(t2) > len(t1)
+
+
+# --- filename, VAT display, watermark ------------------------------------
+
+def test_filename_uses_client_name_and_date():
+    from datetime import date
+
+    from app.pdf import quote_filename
+
+    name = quote_filename(KitchenSpec(client_name="דני כהן"), 1, date(2026, 9, 15))
+    assert name == "דני-כהן_2026-09-15.pdf"
+
+
+def test_filename_falls_back_to_quote_id_without_a_client():
+    from datetime import date
+
+    from app.pdf import quote_filename
+
+    name = quote_filename(KitchenSpec(), 7, date(2026, 9, 15))
+    assert name == "quote-00007_2026-09-15.pdf"
+
+
+def test_filename_strips_characters_windows_rejects():
+    from datetime import date
+
+    from app.pdf import quote_filename
+
+    name = quote_filename(
+        KitchenSpec(client_name='דני/כהן: בע"מ <x>'), 2, date(2026, 9, 15)
+    )
+    for bad in r'<>:"/\|?*':
+        assert bad not in name
+    assert name.endswith("_2026-09-15.pdf")
+    # Hebrew must survive -- the carpenter recognizes the file by it.
+    assert "דני" in name
+
+
+def test_pdf_shows_subtotal_vat_and_inclusive_total(catalog, tmp_path, monkeypatch):
+    """The carpenter asked for the price both before and after VAT."""
+    monkeypatch.setattr("app.pdf.QUOTES_DIR", tmp_path)
+    biz = BusinessConfig(vat_pct=18.0)
+    spec = KitchenSpec(client_name="דני", material="מלמין 18",
+                       cabinet_count=10, drawer_count=4, labor_hours=20.0)
+    breakdown = calculate_quote(spec, catalog, biz)
+    out = render_quote_pdf(spec, breakdown, biz, 1)
+
+    text = pymupdf.open(str(out))[0].get_text()
+    assert f"{breakdown.subtotal:,.0f}" in text
+    assert f"{breakdown.vat_amount:,.0f}" in text
+    assert f"{breakdown.total:,.0f}" in text
+    assert "18" in text
+
+
+def test_vat_rows_are_present_even_at_zero_vat(catalog, tmp_path, monkeypatch):
+    """Both figures are always shown, so the layout must not depend on VAT."""
+    monkeypatch.setattr("app.pdf.QUOTES_DIR", tmp_path)
+    biz = BusinessConfig(vat_pct=0.0)
+    spec = KitchenSpec(material="מלמין 18", cabinet_count=4, drawer_count=0,
+                       labor_hours=5.0)
+    breakdown = calculate_quote(spec, catalog, biz)
+    out = render_quote_pdf(spec, breakdown, biz, 2)
+    text = pymupdf.open(str(out))[0].get_text()
+    assert f"{breakdown.total:,.0f}" in text
+
+
+def test_render_succeeds_when_no_logo_file_exists(catalog, tmp_path, monkeypatch):
+    """The watermark is optional: a missing logo must not break rendering."""
+    monkeypatch.setattr("app.pdf.QUOTES_DIR", tmp_path)
+    monkeypatch.setattr("app.pdf.LOGO_PATH", tmp_path / "definitely-absent.png")
+    biz = BusinessConfig()
+    spec = KitchenSpec(material="מלמין 18", cabinet_count=4, labor_hours=5.0)
+    breakdown = calculate_quote(spec, catalog, biz)
+    out = render_quote_pdf(spec, breakdown, biz, 3)
+    assert out.exists()
+
+
+def test_watermark_is_drawn_when_a_logo_exists(catalog, tmp_path, monkeypatch):
+    """A real logo must land in the PDF as an embedded image."""
+    logo = tmp_path / "logo.png"
+    try:
+        from PIL import Image
+
+        Image.new("RGB", (400, 200), (200, 170, 60)).save(logo)
+    except ImportError:
+        pytest.skip("PIL not available to synthesize a logo")
+
+    monkeypatch.setattr("app.pdf.QUOTES_DIR", tmp_path)
+    monkeypatch.setattr("app.pdf.LOGO_PATH", logo)
+    biz = BusinessConfig()
+    spec = KitchenSpec(material="מלמין 18", cabinet_count=4, labor_hours=5.0)
+    breakdown = calculate_quote(spec, catalog, biz)
+    out = render_quote_pdf(spec, breakdown, biz, 4)
+
+    doc = pymupdf.open(str(out))
+    assert len(doc[0].get_images()) >= 1, "logo was not embedded in the page"
+    doc.close()

@@ -44,6 +44,8 @@ AWAIT_CORRECTION = "correction"
 CB_APPROVE = "approve"
 CB_CORRECT = "correct"
 CB_CANCEL = "cancel"
+# Second, explicit confirmation when a value is outside plausible bounds.
+CB_CONFIRM_ANYWAY = "confirm_anyway"
 
 WELCOME = (
     "שלום! שלח לי הקלטה קולית או הודעת טקסט עם תיאור המטבח, "
@@ -99,6 +101,12 @@ def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
         lines.append(f"לפני מע\"מ: {sym}{breakdown.subtotal:,.0f}")
         lines.append(f"מע\"מ: {sym}{breakdown.vat_amount:,.0f}")
     lines.append(f"*סה\"כ: {sym}{breakdown.total:,.0f}*")
+
+    if breakdown.sanity_alerts:
+        lines.append("")
+        lines.append("🛑 *ערכים חריגים — חייבים אישור נוסף:*")
+        for alert in breakdown.sanity_alerts:
+            lines.append(f"  · {alert}")
 
     if breakdown.warnings:
         lines.append("")
@@ -351,6 +359,43 @@ async def _route_text(
     await _price_and_show_draft(update, chat_id, spec)
 
 
+async def _render_and_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    spec: KitchenSpec,
+    breakdown: QuoteBreakdown,
+    query,
+) -> None:
+    """Persist the quote, render the PDF, and send it back."""
+    quote_id = db.create_quote(
+        chat_id, spec.client_name, spec.model_dump(),
+        breakdown.model_dump(), breakdown.total, status="draft",
+    )
+    await query.edit_message_text("✅ מאושר. מכין PDF...")
+
+    try:
+        pdf_path = render_quote_pdf(
+            spec, breakdown, get_settings().business, quote_id
+        )
+    except Exception:
+        log.exception("pdf render failed")
+        await context.bot.send_message(chat_id, "יצירת ה-PDF נכשלה.")
+        return
+
+    db.mark_quote_approved(quote_id, str(pdf_path))
+    db.clear_pending(chat_id)
+
+    sym = breakdown.currency_symbol
+    caption = (
+        f"הצעה #{quote_id} · {sym}{breakdown.total:,.0f} כולל מע\"מ\n"
+        f"לפני מע\"מ: {sym}{breakdown.subtotal:,.0f}"
+    )
+    with pdf_path.open("rb") as fh:
+        await context.bot.send_document(
+            chat_id, document=fh, filename=pdf_path.name, caption=caption,
+        )
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
@@ -379,38 +424,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if query.data == CB_APPROVE:
+    if query.data in (CB_APPROVE, CB_CONFIRM_ANYWAY):
         if not pending["breakdown"]:
             await query.edit_message_text("חסר חישוב. שלח תיאור מחדש.")
             return
         breakdown = QuoteBreakdown(**pending["breakdown"])
 
-        quote_id = db.create_quote(
-            chat_id, spec.client_name, spec.model_dump(),
-            breakdown.model_dump(), breakdown.total, status="draft",
-        )
-        await query.edit_message_text("✅ מאושר. מכין PDF...")
-
-        try:
-            pdf_path = render_quote_pdf(
-                spec, breakdown, get_settings().business, quote_id
+        # An implausible value must be confirmed explicitly: a wrong dimension
+        # reaching a client's PDF is worse than one extra tap.
+        if breakdown.needs_confirmation and query.data != CB_CONFIRM_ANYWAY:
+            alerts = "\n".join(f"  · {a}" for a in breakdown.sanity_alerts)
+            await query.edit_message_text(
+                "🛑 *רגע לפני שליחה*\n\n"
+                "זיהיתי ערכים שנראים חריגים:\n"
+                f"{alerts}\n\n"
+                "אם הם נכונים — אשר שוב. אחרת בחר תיקון.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ כן, המשך בכל זאת",
+                                         callback_data=CB_CONFIRM_ANYWAY),
+                    InlineKeyboardButton("✏️ תיקון", callback_data=CB_CORRECT),
+                ]]),
             )
-        except Exception:
-            log.exception("pdf render failed")
-            await context.bot.send_message(chat_id, "יצירת ה-PDF נכשלה.")
             return
 
-        db.mark_quote_approved(quote_id, str(pdf_path))
-        db.clear_pending(chat_id)
-
-        with pdf_path.open("rb") as fh:
-            await context.bot.send_document(
-                chat_id,
-                document=fh,
-                filename=pdf_path.name,
-                caption=f"הצעה #{quote_id} · "
-                        f"{breakdown.currency_symbol}{breakdown.total:,.0f}",
-            )
+        await _render_and_send(context, chat_id, spec, breakdown, query)
 
 
 def build_application() -> Application:
