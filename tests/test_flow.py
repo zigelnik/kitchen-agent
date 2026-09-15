@@ -233,3 +233,84 @@ def test_status_command_is_registered(monkeypatch):
         assert "status" in commands
     finally:
         get_settings.cache_clear()
+
+
+# --- Telegram message safety ---------------------------------------------
+# A real draft failed to send with "Can't parse entities: can't find end of
+# the entity starting at byte offset 1293". The cause was a single unmatched
+# "_" from the field name `dimensions_m` in the low-confidence list, which
+# Telegram's Markdown parser read as an unterminated italic run. Worse, the
+# error was reported to the carpenter as a network failure, because
+# BadRequest subclasses NetworkError in python-telegram-bot.
+
+
+def _draft_with_awkward_text():
+    from app.catalog import Catalog, CatalogItem
+    from app.config import BusinessConfig
+    from app.pricing import calculate_quote
+
+    catalog = Catalog([
+        CatalogItem('מלמין 18 מ"מ', "material", "cabinet", 320.0),
+        CatalogItem("שיש גרניט", "material", "meter", 1100.0),
+        CatalogItem("ציר רגיל", "hardware", "unit", 18.0),
+        CatalogItem("ידית נירוסטה", "hardware", "unit", 55.0),
+        CatalogItem("הובלה והתקנה", "transport", "flat", 250.0),
+    ])
+    spec = KitchenSpec(
+        client_name="שלומי לוי",
+        material='פורניר (גוף), לכה (חזיתות)',
+        cabinet_count=5,
+        countertop="גרניט",
+        labor_hours=20.0,
+        notes='הנגר ציין צורת מטבח "פער" - ייתכן טעות. גודל כ"10 מטר" *לא* ברור_',
+        low_confidence_fields=["dimensions_m", "countertop_length_m", "material"],
+    )
+    return spec, calculate_quote(spec, catalog, BusinessConfig(vat_pct=18.0))
+
+
+def test_draft_contains_no_markdown_control_characters():
+    """The draft is sent as plain text, so it must not rely on Markdown."""
+    from app.bot import _format_draft
+
+    spec, breakdown = _draft_with_awkward_text()
+    msg = _format_draft(spec, breakdown)
+    # Underscores and asterisks from parser free text must not appear as
+    # formatting; they are what broke the send.
+    assert "_m" not in msg, "raw field identifiers leaked into the message"
+
+
+def test_low_confidence_fields_render_as_hebrew_labels():
+    from app.bot import _format_draft
+
+    spec, breakdown = _draft_with_awkward_text()
+    msg = _format_draft(spec, breakdown)
+    assert "dimensions_m" not in msg
+    assert "countertop_length_m" not in msg
+    assert "מידות" in msg
+    assert "אורך משטח" in msg
+
+
+def test_no_handler_sends_with_markdown_parse_mode():
+    """Markdown over parser-generated Hebrew is what caused the outage."""
+    import inspect
+
+    from app import bot
+
+    assert "parse_mode" not in inspect.getsource(bot), (
+        "a parse_mode was reintroduced; Hebrew free text from the parser "
+        "will eventually contain an unmatched _ or * and Telegram will "
+        "reject the entire message"
+    )
+
+
+def test_bad_request_is_not_treated_as_transient():
+    """BadRequest subclasses NetworkError, which made a 400 look like a
+    dropped connection and got retried four times for nothing."""
+    from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+
+    from app.bot import _is_transient
+
+    assert not _is_transient(BadRequest("Can't parse entities"))
+    assert not _is_transient(Forbidden("bot was blocked"))
+    assert _is_transient(NetworkError("getaddrinfo failed"))
+    assert _is_transient(TimedOut())

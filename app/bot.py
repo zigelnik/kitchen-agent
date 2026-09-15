@@ -13,7 +13,7 @@ import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -79,9 +79,40 @@ def _is_allowed(update: Update) -> bool:
 
 # --- message formatting ----------------------------------------------------
 
+# Human-readable Hebrew names for spec fields. Raw identifiers such as
+# `dimensions_m` both look wrong to the carpenter and -- ending in "_m" --
+# used to break Telegram's Markdown parser, rejecting the entire message.
+FIELD_LABELS_HE = {
+    "client_name": "שם הלקוח",
+    "layout": "צורת המטבח",
+    "dimensions_m": "מידות",
+    "material": "חומר החזיתות",
+    "cabinet_count": "מספר ארונות",
+    "drawer_count": "מספר מגירות",
+    "drawer_type": "סוג מגירות",
+    "hinge_type": "צירים",
+    "handle_type": "ידיות",
+    "countertop": "משטח עבודה",
+    "countertop_length_m": "אורך משטח",
+    "labor_hours": "שעות עבודה",
+    "notes": "הערות",
+}
+
+
+def _field_label(name: str) -> str:
+    return FIELD_LABELS_HE.get(name, name)
+
+
 def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
+    """Build the draft as PLAIN TEXT.
+
+    Deliberately no Markdown: the parser's Hebrew notes contain quotes,
+    underscores and hyphens, and a single unmatched one makes Telegram reject
+    the whole message with "Can't parse entities" -- which looked to the
+    carpenter like the bot had silently died.
+    """
     sym = breakdown.currency_symbol
-    lines = ["*הצעת מחיר — טיוטה*", ""]
+    lines = ["הצעת מחיר — טיוטה", "─────────────────", ""]
 
     if spec.client_name:
         lines.append(f"לקוח: {spec.client_name}")
@@ -105,11 +136,11 @@ def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
     if breakdown.vat_amount:
         lines.append(f"לפני מע\"מ: {sym}{breakdown.subtotal:,.0f}")
         lines.append(f"מע\"מ: {sym}{breakdown.vat_amount:,.0f}")
-    lines.append(f"*סה\"כ: {sym}{breakdown.total:,.0f}*")
+    lines.append(f"סה\"כ: {sym}{breakdown.total:,.0f}")
 
     if breakdown.sanity_alerts:
         lines.append("")
-        lines.append("🛑 *ערכים חריגים — חייבים אישור נוסף:*")
+        lines.append("🛑 ערכים חריגים — חייבים אישור נוסף:")
         for alert in breakdown.sanity_alerts:
             lines.append(f"  · {alert}")
 
@@ -128,9 +159,8 @@ def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
 
     if spec.low_confidence_fields:
         lines.append("")
-        lines.append(
-            "❓ שדות בניחוש: " + ", ".join(spec.low_confidence_fields)
-        )
+        readable = ", ".join(_field_label(f) for f in spec.low_confidence_fields)
+        lines.append(f"❓ שדות בניחוש: {readable}")
 
     return "\n".join(lines)
 
@@ -139,19 +169,31 @@ SEND_RETRIES = 4
 SEND_BACKOFF_BASE = 1.5
 
 
-async def _send_with_retry(coro_factory, what: str):
-    """Retry a Telegram send through transient network loss.
+def _is_transient(exc: BaseException) -> bool:
+    """Is this worth retrying?
 
-    A real draft was computed and then lost because the machine briefly failed
-    DNS resolution: the quote existed in the database but never reached the
-    carpenter, and with no error handler registered he saw only silence.
-    Retrying costs nothing and covers the common case of a few seconds offline.
+    Careful: in python-telegram-bot BadRequest and Forbidden both subclass
+    NetworkError, so a naive isinstance(exc, NetworkError) treats a 400 as a
+    connectivity problem -- retrying it pointlessly and telling the carpenter
+    the network dropped when in fact the message itself was malformed. That
+    exact bug hid a Markdown parse failure behind a "connection lost" notice.
     """
+    if isinstance(exc, (BadRequest, Forbidden)):
+        return False
+    return isinstance(exc, (NetworkError, TimedOut))
+
+
+async def _send_with_retry(coro_factory, what: str):
+    """Retry a Telegram send through transient network loss only."""
     delay = SEND_BACKOFF_BASE
     for attempt in range(1, SEND_RETRIES + 1):
         try:
             return await coro_factory()
         except (NetworkError, TimedOut) as exc:
+            if not _is_transient(exc):
+                # A malformed request will fail identically every time.
+                log.error("%s rejected by Telegram (not retrying): %s", what, exc)
+                raise
             if attempt == SEND_RETRIES:
                 log.error("%s failed after %d attempts: %s", what, attempt, exc)
                 raise
@@ -217,7 +259,6 @@ async def _price_and_show_draft(
     await _send_with_retry(
         lambda: target.reply_text(
             _format_draft(spec, breakdown),
-            parse_mode="Markdown",
             reply_markup=_draft_keyboard(),
         ),
         "draft send",
@@ -400,7 +441,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _send_with_retry(
             lambda: update.effective_message.reply_text(
                 _format_draft(spec, breakdown),
-                parse_mode="Markdown",
                 reply_markup=_draft_keyboard(),
             ),
             "status draft re-send",
@@ -619,11 +659,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if breakdown.needs_confirmation and query.data != CB_CONFIRM_ANYWAY:
             alerts = "\n".join(f"  · {a}" for a in breakdown.sanity_alerts)
             await query.edit_message_text(
-                "🛑 *רגע לפני שליחה*\n\n"
+                "🛑 רגע לפני שליחה\n\n"
                 "זיהיתי ערכים שנראים חריגים:\n"
                 f"{alerts}\n\n"
                 "אם הם נכונים — אשר שוב. אחרת בחר תיקון.",
-                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ כן, המשך בכל זאת",
                                          callback_data=CB_CONFIRM_ANYWAY),

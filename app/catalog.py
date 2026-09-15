@@ -47,6 +47,12 @@ _KIND_MARKERS = (
 # should be rejected so the carpenter learns the brand was unrecognized.
 MIN_QUERY_COVERAGE = 0.5
 
+# Alternative acceptance route: the shared words must make up this much of the
+# CATALOG ITEM's own name. "לכה" fully accounts for "לכה מט" (1 of 2 stems is
+# below this, so it passes on coverage instead), while "מגירת מותג שלא קיים"
+# shares only the generic "מגיר" with "מגירה רגילה" and is correctly rejected.
+MIN_ITEM_SPECIFICITY = 0.6
+
 
 def _stem(word: str) -> str:
     """Strip one Hebrew plural/feminine suffix, keeping the word substantial."""
@@ -135,7 +141,7 @@ class Catalog:
         if not q_tokens:
             return None
 
-        best: tuple[float, int, CatalogItem] | None = None
+        best: tuple[float, float, CatalogItem] | None = None
         for item in pool:
             i_tokens = _stems(item.item_name)
             if not i_tokens:
@@ -144,12 +150,16 @@ class Catalog:
             if not shared:
                 continue
             coverage = len(shared) / len(q_tokens)
-            if coverage < MIN_QUERY_COVERAGE:
-                continue
-            # Tie-break on how much of the item name was also matched, so
-            # "מגירת בלום" beats a bare "מגירה" when both are covered.
             specificity = len(shared) / len(i_tokens)
-            candidate = (coverage, specificity, item)
+            # Accept on EITHER strong signal: enough of what was said is
+            # accounted for, or the shared words carry the catalog item's own
+            # identity. The second arm is what lets a compound answer -- one
+            # naming two materials and the parts they apply to, where no item
+            # can cover half the words -- still match, without letting an
+            # unknown brand ride in on a shared generic noun.
+            if coverage < MIN_QUERY_COVERAGE and specificity < MIN_ITEM_SPECIFICITY:
+                continue
+            candidate = (max(coverage, specificity), specificity, item)
             if best is None or candidate[:2] > best[:2]:
                 best = candidate
 
