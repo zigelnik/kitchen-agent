@@ -595,7 +595,18 @@ async def _render_and_send(
         chat_id, spec.client_name, spec.model_dump(),
         breakdown.model_dump(), breakdown.total, status="draft",
     )
-    await query.edit_message_text("✅ מאושר. מכין PDF...")
+    # Keep the draft visible after approval -- it is the record of what was
+    # approved. Only the buttons are removed, so the same draft cannot be
+    # approved twice.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        log.debug("could not clear draft buttons", exc_info=True)
+
+    progress = await _send_with_retry(
+        lambda: context.bot.send_message(chat_id, "✅ מאושר. מכין PDF..."),
+        "approval notice",
+    )
 
     try:
         pdf_path = render_quote_pdf(
@@ -603,8 +614,17 @@ async def _render_and_send(
         )
     except Exception:
         log.exception("pdf render failed")
-        await context.bot.send_message(chat_id, "יצירת ה-PDF נכשלה.")
+        await context.bot.send_message(
+            chat_id,
+            "❌ יצירת ה-PDF נכשלה. הטיוטה נשמרה — שלח /status.",
+        )
         return
+
+    if progress is not None:
+        try:
+            await progress.delete()
+        except Exception:
+            log.debug("could not remove progress notice", exc_info=True)
 
     db.mark_quote_approved(quote_id, str(pdf_path))
     db.clear_pending(chat_id)
@@ -642,9 +662,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if query.data == CB_CORRECT:
         db.save_pending(chat_id, pending["spec"], pending["breakdown"],
                         awaiting_kind=AWAIT_CORRECTION)
-        await query.edit_message_text(
-            "מה לתקן? כתוב או הקלט את התיקון.\n"
-            "לדוגמה: \"תחליף לידיות שחורות\" או \"14 ארונות\""
+        # Leave the draft on screen: the carpenter needs to read the numbers
+        # he is correcting. Only the buttons come off, so the stale draft
+        # cannot be approved after a correction is already in flight.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            log.debug("could not clear draft buttons", exc_info=True)
+        await _send_with_retry(
+            lambda: context.bot.send_message(
+                chat_id,
+                "מה לתקן? כתוב או הקלט את התיקון.\n"
+                "לדוגמה: \"תחליף לידיות שחורות\" או \"14 ארונות\"",
+            ),
+            "correction prompt",
         )
         return
 
@@ -658,16 +689,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # reaching a client's PDF is worse than one extra tap.
         if breakdown.needs_confirmation and query.data != CB_CONFIRM_ANYWAY:
             alerts = "\n".join(f"  · {a}" for a in breakdown.sanity_alerts)
-            await query.edit_message_text(
-                "🛑 רגע לפני שליחה\n\n"
-                "זיהיתי ערכים שנראים חריגים:\n"
-                f"{alerts}\n\n"
-                "אם הם נכונים — אשר שוב. אחרת בחר תיקון.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ כן, המשך בכל זאת",
-                                         callback_data=CB_CONFIRM_ANYWAY),
-                    InlineKeyboardButton("✏️ תיקון", callback_data=CB_CORRECT),
-                ]]),
+            # Ask in a new message so the draft being confirmed stays readable.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                log.debug("could not clear draft buttons", exc_info=True)
+            await _send_with_retry(
+                lambda: context.bot.send_message(
+                    chat_id,
+                    "🛑 רגע לפני שליחה\n\n"
+                    "זיהיתי ערכים שנראים חריגים:\n"
+                    f"{alerts}\n\n"
+                    "אם הם נכונים — אשר שוב. אחרת בחר תיקון.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ כן, המשך בכל זאת",
+                                             callback_data=CB_CONFIRM_ANYWAY),
+                        InlineKeyboardButton("✏️ תיקון", callback_data=CB_CORRECT),
+                    ]]),
+                ),
+                "sanity confirmation",
             )
             return
 

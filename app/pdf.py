@@ -110,10 +110,70 @@ def quote_filename(
     return f"quote-{quote_id:05d}_{stamp}.pdf"
 
 
-# Watermark tuning. The logo is a light wordmark, so it needs to be faint
-# enough not to fight the table text but visible enough to read as branding.
-WATERMARK_ALPHA = 0.10
-WATERMARK_WIDTH_FRAC = 0.85
+# Watermark tuning. Large enough to read as branding, faint enough that the
+# line-item table stays legible on top of it.
+WATERMARK_STRENGTH = 0.13
+WATERMARK_WIDTH_FRAC = 0.80
+
+_watermark_cache: ImageReader | None = None
+_watermark_key: tuple[str, float, int] | None = None
+
+
+def _prepare_watermark() -> ImageReader | None:
+    """Load the logo and fade it toward white for use as a background.
+
+    The supplied logo is an OPAQUE image (a .png-named JPEG with no alpha
+    channel), so its cream background would paint over the whole page and
+    canvas alpha alone cannot rescue it. Instead the pixels are blended
+    toward white here, which both removes the background block and produces
+    the faint wash a watermark needs. Cached, since this runs per page.
+    """
+    global _watermark_cache, _watermark_key
+
+    if not LOGO_PATH.exists():
+        return None
+
+    try:
+        stat = LOGO_PATH.stat()
+        key = (str(LOGO_PATH), stat.st_mtime, stat.st_size)
+        if _watermark_cache is not None and _watermark_key == key:
+            return _watermark_cache
+
+        from PIL import Image, ImageChops
+
+        with Image.open(LOGO_PATH) as src:
+            logo = src.convert("RGB")
+
+        # The logo sits on a cream field, not white. Blending straight to
+        # white keeps that field as a visible tinted rectangle on the page,
+        # so first normalize the lightest pixels up to pure white: sample the
+        # corner for the background colour and scale each channel so it maps
+        # to 255. The dark wordmark is far from that value and survives.
+        bg = logo.getpixel((2, 2))
+        scales = [255.0 / max(c, 1) for c in bg]
+        normalized = Image.merge("RGB", [
+            # round(), not int(): truncation leaves the background a channel
+            # short of pure white, which still reads as a faint rectangle.
+            channel.point(lambda v, s=s: min(255, round(v * s)))
+            for channel, s in zip(logo.split(), scales)
+        ])
+        # Guard against a logo whose corner is not background: if that made
+        # the image essentially blank, fall back to the raw image.
+        if ImageChops.difference(
+            normalized, Image.new("RGB", logo.size, (255, 255, 255))
+        ).getbbox() is None:
+            normalized = logo
+
+        white = Image.new("RGB", normalized.size, (255, 255, 255))
+        faded = Image.blend(white, normalized, WATERMARK_STRENGTH)
+
+        _watermark_cache = ImageReader(faded)
+        _watermark_key = key
+        return _watermark_cache
+    except Exception:
+        log.warning("could not prepare logo at %s; skipping watermark",
+                    LOGO_PATH, exc_info=True)
+        return None
 
 
 def _draw_watermark(canvas, doc) -> None:
@@ -122,32 +182,23 @@ def _draw_watermark(canvas, doc) -> None:
     Drawn on the canvas rather than added to the story so it sits behind the
     content and repeats per page without affecting layout.
     """
-    if not LOGO_PATH.exists():
-        return
-    try:
-        image = ImageReader(str(LOGO_PATH))
-        iw, ih = image.getSize()
-    except Exception:
-        log.warning("could not read logo at %s; skipping watermark", LOGO_PATH)
+    image = _prepare_watermark()
+    if image is None:
         return
 
+    iw, ih = image.getSize()
     page_w, page_h = A4
     target_w = page_w * WATERMARK_WIDTH_FRAC
     target_h = target_w * (ih / iw)
 
     canvas.saveState()
     try:
-        # setFillAlpha needs a PDF 1.4+ transparency group; guard for older
-        # ReportLab builds that lack it.
-        if hasattr(canvas, "setFillAlpha"):
-            canvas.setFillAlpha(WATERMARK_ALPHA)
         canvas.drawImage(
             image,
             (page_w - target_w) / 2,
             (page_h - target_h) / 2,
             width=target_w,
             height=target_h,
-            mask="auto",
             preserveAspectRatio=True,
         )
     except Exception:

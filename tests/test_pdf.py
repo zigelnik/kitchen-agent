@@ -195,3 +195,66 @@ def test_watermark_is_drawn_when_a_logo_exists(catalog, tmp_path, monkeypatch):
     doc = pymupdf.open(str(out))
     assert len(doc[0].get_images()) >= 1, "logo was not embedded in the page"
     doc.close()
+
+
+# --- watermark from the real, opaque logo --------------------------------
+# The supplied logo is a .png-named JPEG with NO alpha channel, on a cream
+# (249,245,242) field. Drawn as-is it paints a tinted rectangle over the page.
+
+
+def test_watermark_background_is_normalized_to_white(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import app.pdf as pdf_mod
+
+    # A cream field with a dark mark, matching the real logo's structure.
+    logo = tmp_path / "logo.png"
+    img = Image.new("RGB", (200, 100), (249, 245, 242))
+    for x in range(80, 120):
+        for y in range(40, 60):
+            img.putpixel((x, y), (120, 90, 10))
+    img.save(logo)
+
+    monkeypatch.setattr(pdf_mod, "LOGO_PATH", logo)
+    monkeypatch.setattr(pdf_mod, "_watermark_cache", None)
+    monkeypatch.setattr(pdf_mod, "_watermark_key", None)
+
+    reader = pdf_mod._prepare_watermark()
+    assert reader is not None
+
+    faded = reader._image if hasattr(reader, "_image") else None
+    if faded is None:
+        pytest.skip("ImageReader did not expose the PIL image")
+    # The corner must be pure white, or it shows as a rectangle on the page.
+    assert faded.convert("RGB").getpixel((2, 2)) == (255, 255, 255)
+    # The mark itself must still be lighter than the original but present.
+    mark = faded.convert("RGB").getpixel((100, 50))
+    assert mark != (255, 255, 255), "the wordmark was faded away entirely"
+
+
+def test_watermark_is_cached_between_pages(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import app.pdf as pdf_mod
+
+    logo = tmp_path / "logo.png"
+    Image.new("RGB", (100, 50), (250, 246, 243)).save(logo)
+    monkeypatch.setattr(pdf_mod, "LOGO_PATH", logo)
+    monkeypatch.setattr(pdf_mod, "_watermark_cache", None)
+    monkeypatch.setattr(pdf_mod, "_watermark_key", None)
+
+    first = pdf_mod._prepare_watermark()
+    second = pdf_mod._prepare_watermark()
+    assert first is second, "watermark is re-processed on every page"
+
+
+def test_real_project_logo_produces_a_watermark():
+    """Guards the actual asset in the repo, not a synthetic stand-in."""
+    import app.pdf as pdf_mod
+    from app.config import LOGO_PATH as real_logo
+
+    if not real_logo.exists():
+        pytest.skip("assets/logo.png not present")
+    pdf_mod._watermark_cache = None
+    pdf_mod._watermark_key = None
+    assert pdf_mod._prepare_watermark() is not None

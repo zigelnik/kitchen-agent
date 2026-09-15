@@ -314,3 +314,46 @@ def test_bad_request_is_not_treated_as_transient():
     assert not _is_transient(Forbidden("bot was blocked"))
     assert _is_transient(NetworkError("getaddrinfo failed"))
     assert _is_transient(TimedOut())
+
+
+# --- the draft must stay on screen ---------------------------------------
+# Correcting or approving used to overwrite the draft via edit_message_text,
+# so the carpenter lost the numbers he was acting on.
+
+
+def test_correct_and_approve_do_not_overwrite_the_draft():
+    import inspect
+
+    from app import bot
+
+    src = inspect.getsource(bot.on_callback)
+    correct_block = src.split("CB_CORRECT:")[1].split("return")[0]
+    assert "edit_message_text" not in correct_block, (
+        "pressing תיקון must not replace the draft text"
+    )
+    assert "edit_message_reply_markup" in correct_block, (
+        "the stale draft's buttons must be removed so it cannot be approved"
+    )
+
+
+def test_approval_keeps_the_draft_and_only_drops_buttons():
+    import inspect
+
+    from app import bot
+
+    src = inspect.getsource(bot._render_and_send)
+    assert "edit_message_text" not in src, (
+        "approving must not replace the draft with a progress notice"
+    )
+    assert "edit_message_reply_markup" in src
+
+
+def test_cancel_still_clears_the_draft():
+    """Cancelling SHOULD replace the message -- the draft is being discarded."""
+    import inspect
+
+    from app import bot
+
+    src = inspect.getsource(bot.on_callback)
+    cancel_block = src.split("CB_CANCEL:")[1].split("return")[0]
+    assert "edit_message_text" in cancel_block
