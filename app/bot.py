@@ -106,6 +106,19 @@ def _format_draft(spec: KitchenSpec, breakdown: QuoteBreakdown) -> str:
         for warning in breakdown.warnings:
             lines.append(f"  · {warning}")
 
+    # The parser flags genuine ambiguities here (a number it could not place,
+    # an implausible measurement). That is exactly what to check before
+    # sending a quote to a client, so it belongs in the draft.
+    if spec.notes:
+        lines.append("")
+        lines.append(f"📝 הערות לבדיקה: {spec.notes}")
+
+    if spec.low_confidence_fields:
+        lines.append("")
+        lines.append(
+            "❓ שדות בניחוש: " + ", ".join(spec.low_confidence_fields)
+        )
+
     return "\n".join(lines)
 
 
@@ -134,6 +147,27 @@ async def _price_and_show_draft(
     )
 
 
+MIN_DESCRIPTION_CHARS = 12
+MIN_DESCRIPTION_WORDS = 3
+
+
+def _looks_like_a_description(text: str) -> bool:
+    """Cheap sanity check before spending an API call.
+
+    A kitchen description is a sentence. A stray one-word message -- a typo, a
+    forwarded token, an accidental tap -- is not, and parsing it costs money
+    and leaves confusing pending state behind.
+    """
+    stripped = text.strip()
+    if len(stripped) < MIN_DESCRIPTION_CHARS:
+        return False
+    if len(stripped.split()) < MIN_DESCRIPTION_WORDS:
+        return False
+    # Require at least one Hebrew letter or digit: a bare Latin token is never
+    # a Hebrew kitchen description.
+    return any("֐" <= ch <= "׿" or ch.isdigit() for ch in stripped)
+
+
 async def _handle_new_description(
     update: Update, chat_id: int, text: str, was_voice: bool
 ) -> None:
@@ -142,6 +176,13 @@ async def _handle_new_description(
     if not settings.has_anthropic:
         await update.effective_message.reply_text(
             "⚠️ חסר ANTHROPIC_API_KEY בהגדרות — לא ניתן לנתח את התיאור."
+        )
+        return
+
+    if not _looks_like_a_description(text):
+        await update.effective_message.reply_text(
+            "לא זיהיתי תיאור מטבח בהודעה. שלח הקלטה או תיאור עם פרטי העבודה — "
+            "למשל מספר ארונות, חומר, משטח וידיות."
         )
         return
 

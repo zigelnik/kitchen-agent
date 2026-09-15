@@ -130,3 +130,103 @@ def test_spec_merge_preserves_unmentioned_fields():
     assert merged.layout == "L"
     assert merged.material == "melamine"
     assert merged.cabinet_count == 8
+
+
+# --- regressions from the first real voice-note session ------------------
+# All four bugs below were found by reading actual bot output, not by
+# reasoning about the code. Each cost real money on a real quote.
+
+
+@pytest.fixture
+def real_catalog() -> Catalog:
+    """A slice of the shipped catalog, with the names that actually collide."""
+    return Catalog([
+        CatalogItem('מלמין 18 מ"מ', "material", "cabinet", 320.0),
+        CatalogItem("פורניר אלון", "material", "cabinet", 780.0),
+        CatalogItem("שיש אבן קיסר", "material", "meter", 1450.0),
+        CatalogItem("מגירה רגילה", "hardware", "unit", 120.0),
+        CatalogItem("מגירת בלום", "hardware", "unit", 280.0),
+        CatalogItem("ציר רגיל", "hardware", "unit", 18.0),
+        CatalogItem("ציר בלום סגירה שקטה", "hardware", "unit", 42.0),
+        CatalogItem("ידית כרום", "hardware", "unit", 35.0),
+        CatalogItem("ידית שחורה", "hardware", "unit", 45.0),
+        CatalogItem("הובלה והתקנה", "transport", "flat", 250.0),
+    ])
+
+
+def test_plural_speech_matches_singular_catalog(real_catalog):
+    """Whisper hears "ידיות שחורות"; the catalog says "ידית שחורה"."""
+    for spoken in ("ידיות שחורות", "שחורות", "ידית שחורה"):
+        got = real_catalog.find(spoken, category="hardware", kind="handle")
+        assert got is not None and got.item_name == "ידית שחורה", spoken
+
+
+def test_brand_name_resolves_per_kind_not_first_substring(real_catalog):
+    """"בלום" names both a drawer and a hinge. The old matcher returned the
+    hinge when asked for a drawer, pricing a Blum drawer at hinge cost."""
+    drawer = real_catalog.find("בלום", category="hardware", kind="drawer")
+    hinge = real_catalog.find("בלום", category="hardware", kind="hinge")
+    assert drawer.item_name == "מגירת בלום"
+    assert hinge.item_name == "ציר בלום סגירה שקטה"
+
+
+def test_countertop_matches_without_the_shish_prefix(real_catalog):
+    """He says "אבן קיסר"; the catalog says "שיש אבן קיסר"."""
+    got = real_catalog.find("אבן קיסר", category="material", kind="countertop")
+    assert got is not None and got.item_name == "שיש אבן קיסר"
+
+
+def test_carcass_lookup_never_returns_a_countertop(real_catalog):
+    got = real_catalog.find("אבן קיסר", category="material", kind="carcass")
+    assert got is None or got.item_kind == "carcass"
+
+
+def test_blum_drawers_are_not_priced_as_basic_drawers(real_catalog, business):
+    """The expensive bug: 6 Blum drawers billed at ₪120 instead of ₪280."""
+    spec = KitchenSpec(material="פורניר אלון", cabinet_count=12, drawer_count=6,
+                       drawer_type="בלום", handle_type="שחורות",
+                       countertop="אבן קיסר", countertop_length_m=4.0,
+                       labor_hours=25.0)
+    q = calculate_quote(spec, real_catalog, business)
+
+    drawer_line = next(li for li in q.line_items if "מגיר" in li.label)
+    assert drawer_line.unit_price == 280.0
+    handle_line = next(li for li in q.line_items if "ידית" in li.label)
+    assert handle_line.unit_price == 45.0
+    # No silent fallback warnings: every part was matched.
+    assert not [w for w in q.warnings if "לא נמצא" in w]
+
+
+def test_unmatched_hardware_falls_back_within_its_own_kind(real_catalog, business):
+    spec = KitchenSpec(material="פורניר אלון", cabinet_count=4, drawer_count=2,
+                       drawer_type="מגירת מותג שלא קיים", labor_hours=5.0)
+    q = calculate_quote(spec, real_catalog, business)
+    drawer_line = next(li for li in q.line_items if "מגיר" in li.label)
+    # Cheapest DRAWER, not the cheapest hardware item of any kind.
+    assert drawer_line.unit_price == 120.0
+    assert any("לא נמצאה" in w for w in q.warnings)
+
+
+def test_implausible_dimensions_produce_a_warning(real_catalog, business):
+    """The parser accepted "12 על 20 מטר" for a kitchen and priced it silently."""
+    spec = KitchenSpec(material="פורניר אלון", cabinet_count=12, drawer_count=0,
+                       countertop="אבן קיסר", countertop_length_m=40.0,
+                       labor_hours=25.0)
+    q = calculate_quote(spec, real_catalog, business)
+    assert any("חריג" in w for w in q.warnings)
+
+
+def test_implausible_cabinet_count_warns(real_catalog, business):
+    spec = KitchenSpec(material="פורניר אלון", cabinet_count=200,
+                       drawer_count=0, labor_hours=10.0)
+    q = calculate_quote(spec, real_catalog, business)
+    assert any("חריג" in w for w in q.warnings)
+
+
+def test_plausible_values_produce_no_sanity_warnings(real_catalog, business):
+    spec = KitchenSpec(material="פורניר אלון", cabinet_count=12, drawer_count=6,
+                       drawer_type="בלום", handle_type="שחורות",
+                       countertop="אבן קיסר", countertop_length_m=4.0,
+                       labor_hours=25.0)
+    q = calculate_quote(spec, real_catalog, business)
+    assert not [w for w in q.warnings if "חריג" in w]

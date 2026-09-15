@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from telegram import Update
 
@@ -28,28 +30,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-api = FastAPI(title="Kitchen Quote Agent")
-
 _application = None
 
 
-@api.on_event("startup")
-async def _startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global _application
     db.init_db()
     settings = get_settings()
-    if not settings.has_telegram:
+    if settings.has_telegram:
+        _application = build_application()
+        await _application.initialize()
+        log.info("telegram application ready")
+    else:
         log.warning("TELEGRAM_BOT_TOKEN unset — webhook will reject updates")
-        return
-    _application = build_application()
-    await _application.initialize()
-    log.info("telegram application ready")
-
-
-@api.on_event("shutdown")
-async def _shutdown() -> None:
+    yield
     if _application is not None:
         await _application.shutdown()
+
+
+api = FastAPI(title="Kitchen Quote Agent", lifespan=lifespan)
 
 
 @api.get("/health")

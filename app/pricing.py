@@ -18,6 +18,13 @@ from app.models import KitchenSpec, LineItem, QuoteBreakdown
 DEFAULT_CABINET_COUNT = 8
 DEFAULT_COUNTERTOP_M = 3.0
 
+# Sanity bounds. Speech-to-text and the parser both mis-scale numbers
+# ("12 על 20 מטר" for a kitchen), so implausible values are surfaced as
+# warnings rather than silently priced.
+MAX_PLAUSIBLE_CABINETS = 40
+MAX_PLAUSIBLE_COUNTERTOP_M = 15.0
+MAX_PLAUSIBLE_LABOR_HOURS = 200.0
+
 # Labor estimate, used only when the carpenter didn't state hours.
 HOURS_PER_CABINET = 1.5
 HOURS_PER_DRAWER = 0.5
@@ -54,12 +61,26 @@ def calculate_quote(
         cabinets = DEFAULT_CABINET_COUNT
         warnings.append(f"מספר ארונות לא צוין — הונח {cabinets}")
 
+    if cabinets > MAX_PLAUSIBLE_CABINETS:
+        warnings.append(
+            f"⚠️ {cabinets} ארונות — מספר חריג, כדאי לוודא לפני שליחה"
+        )
+
     drawers = spec.drawer_count if spec.drawer_count is not None else 0
     if spec.drawer_count is None:
         warnings.append("מספר מגירות לא צוין — הונח 0")
 
+    if spec.countertop_length_m and spec.countertop_length_m > MAX_PLAUSIBLE_COUNTERTOP_M:
+        warnings.append(
+            f"⚠️ אורך משטח {spec.countertop_length_m} מ' — חריג, כדאי לוודא"
+        )
+    if spec.labor_hours and spec.labor_hours > MAX_PLAUSIBLE_LABOR_HOURS:
+        warnings.append(
+            f"⚠️ {spec.labor_hours} שעות עבודה — חריג, כדאי לוודא"
+        )
+
     # --- carcass material, priced per cabinet ---
-    mat = catalog.find(spec.material, category="material")
+    mat = catalog.find(spec.material, category="material", kind="carcass")
     if mat is None or mat.unit != "cabinet":
         mat = catalog.cheapest("material", unit="cabinet")
         if spec.material:
@@ -70,7 +91,7 @@ def calculate_quote(
         lines.append(_line(mat, f"{mat.item_name} × {cabinets} ארונות", cabinets))
 
     # --- countertop, priced per metre ---
-    top = catalog.find(spec.countertop, category="material")
+    top = catalog.find(spec.countertop, category="material", kind="countertop")
     if top is not None and top.unit == "meter":
         length = spec.countertop_length_m
         if length is None or length <= 0:
@@ -81,31 +102,41 @@ def calculate_quote(
         warnings.append(f'משטח "{spec.countertop}" לא נמצא בקטלוג — לא חויב')
 
     # --- hardware ---
+    # `kind` keeps each lookup inside its own family, so a brand name like
+    # "בלום" -- which names both a drawer and a hinge -- resolves correctly.
     if drawers > 0:
-        drawer = catalog.find(spec.drawer_type, category="hardware") or catalog.cheapest(
-            "hardware", unit="unit"
-        )
-        # Guard against matching a hinge/handle when drawer_type was vague.
-        if drawer is not None and "מגיר" not in drawer.item_name:
-            drawer = catalog.find("מגירה רגילה", category="hardware")
+        drawer = catalog.find(spec.drawer_type, category="hardware", kind="drawer")
+        if drawer is None:
+            drawer = catalog.cheapest_of_kind("hardware", "drawer")
+            if spec.drawer_type:
+                warnings.append(
+                    f'מגירה "{spec.drawer_type}" לא נמצאה בקטלוג — '
+                    f'חושב לפי {drawer.item_name if drawer else "?"}'
+                )
         if drawer is not None:
             lines.append(_line(drawer, f"{drawer.item_name} × {drawers}", drawers))
 
     hinges = cabinets * 2  # two hinges per door, standard
-    hinge = catalog.find(spec.hinge_type, category="hardware")
-    if hinge is None or "ציר" not in hinge.item_name:
-        hinge = catalog.find("ציר רגיל", category="hardware")
+    hinge = catalog.find(spec.hinge_type, category="hardware", kind="hinge")
+    if hinge is None:
+        hinge = catalog.cheapest_of_kind("hardware", "hinge")
         if spec.hinge_type:
-            warnings.append(f'ציר "{spec.hinge_type}" לא נמצא — חושב לפי ציר רגיל')
+            warnings.append(
+                f'ציר "{spec.hinge_type}" לא נמצא — '
+                f'חושב לפי {hinge.item_name if hinge else "?"}'
+            )
     if hinge is not None:
         lines.append(_line(hinge, f"{hinge.item_name} × {hinges}", hinges))
 
     handles = cabinets + drawers
-    handle = catalog.find(spec.handle_type, category="hardware")
-    if handle is None or "ידית" not in handle.item_name:
-        handle = catalog.find("ידית כרום", category="hardware")
+    handle = catalog.find(spec.handle_type, category="hardware", kind="handle")
+    if handle is None:
+        handle = catalog.cheapest_of_kind("hardware", "handle")
         if spec.handle_type:
-            warnings.append(f'ידית "{spec.handle_type}" לא נמצאה — חושב לפי ידית כרום')
+            warnings.append(
+                f'ידית "{spec.handle_type}" לא נמצאה — '
+                f'חושב לפי {handle.item_name if handle else "?"}'
+            )
     if handle is not None:
         lines.append(_line(handle, f"{handle.item_name} × {handles}", handles))
 

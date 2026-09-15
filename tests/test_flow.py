@@ -110,3 +110,37 @@ def test_correction_merge_keeps_prior_answers():
     assert merged.material == "פורניר אלון"
     assert merged.cabinet_count == 12
     assert merged.drawer_count == 6
+
+
+def test_junk_text_is_rejected_before_any_api_call():
+    """Guards the bug that burned a real API request on the string 'getUpdates'."""
+    from app.bot import _looks_like_a_description as looks
+
+    for junk in ("getUpdates", "start", "ok", "/x", "שלום", "hi there", "a b c"):
+        assert not looks(junk), f"{junk!r} should not reach the parser"
+
+
+def test_real_descriptions_pass_the_guard():
+    from app.bot import _looks_like_a_description as looks
+
+    for real in (
+        "מטבח בצורת L ללקוח דני, 12 ארונות פורניר אלון, ידיות שחורות",
+        "12 ארונות מלמין עם שיש אבן קיסר 4 מטר",
+        "מטבח ישר 6 ארונות, 4 מגירות בלום, משטח למינציה",
+    ):
+        assert looks(real), f"{real!r} should reach the parser"
+
+
+def test_guard_only_gates_new_descriptions_not_corrections():
+    """Short replies are valid mid-conversation, so the guard must not be
+    applied to clarification answers or corrections."""
+    import inspect
+
+    from app import bot
+
+    # The guard is called in _handle_new_description and nowhere else.
+    assert "_looks_like_a_description" in inspect.getsource(
+        bot._handle_new_description
+    )
+    for fn in (bot._route_text, bot.on_callback):
+        assert "_looks_like_a_description" not in inspect.getsource(fn)

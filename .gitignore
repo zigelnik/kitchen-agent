@@ -179,3 +179,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- kitchen-agent runtime data ---
+# Generated at runtime and contains real client data (names, transcripts,
+# quote PDFs) plus downloaded voice notes. Never commit.
+data/*.db
+data/*.sqlite3
+data/audio/
+data/quotes/
+data/bot.log
+
+# Whisper model weights (~1.5GB, re-downloaded on demand)
+models/
